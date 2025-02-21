@@ -417,6 +417,7 @@ public class ZYGOReportProcess extends SvrProcess {
 
 	private void createCell(Row row, int column, Object value, CellStyle style) {
 		Cell cell = row.createCell(column);
+
 		try {
 			if (value == null) {
 				cell.setCellValue("");
