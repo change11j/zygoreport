@@ -3,9 +3,14 @@ package tw.topgiga.zygoreport.report;
 import java.io.ByteArrayOutputStream;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.util.ArrayList;
-import java.util.List;
+import java.util.Comparator;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 import org.apache.poi.ss.usermodel.BorderStyle;
 import org.apache.poi.ss.usermodel.Cell;
@@ -99,12 +104,12 @@ public class ZYGOReportProcess extends SvrProcess {
 		// 基本條件
 		whereClause.add("m.isactive = 'Y'");
 
-		// 添加所有過濾條件
+		// 添加過濾條件
 		if (p_DateFrom != null) {
-			whereClause.add("m.updated >= " + DB.TO_DATE(p_DateFrom));
+			whereClause.add("md.updated >= " + DB.TO_DATE(p_DateFrom));
 		}
 		if (p_DateTo != null) {
-			whereClause.add("m.updated <= " + DB.TO_DATE(p_DateTo));
+			whereClause.add("md.updated <= " + DB.TO_DATE(p_DateTo));
 		}
 		if (p_GroupName != null && !p_GroupName.trim().isEmpty()) {
 			whereClause.add("m.groupname = " + DB.TO_STRING(p_GroupName));
@@ -118,20 +123,16 @@ public class ZYGOReportProcess extends SvrProcess {
 
 		String whereStr = String.join(" AND ", whereClause);
 
-		sql.append("WITH RankedData AS (").append(
-				"  SELECT m.devicename AS devicename, m.groupname AS groupname, m.samplename AS samplename, m.operator AS operator, ")
-				.append("         m.positionname AS positionname, md.dataname AS dataname, md.datavalue AS datavalue, ")
-				.append("         ma.attributename AS attributename, ma.attributevalue AS attributevalue, ")
-				.append("         md.updated AS updated, ").append("         ROW_NUMBER() OVER (PARTITION BY ")
-				.append("             m.devicename, m.groupname, m.samplename, m.operator, ")
-				.append("             m.positionname, md.dataname, md.datavalue, ")
-				.append("             ma.attributename, ma.attributevalue ")
-				.append("         ORDER BY m.updated DESC) as rn ").append("  FROM measure m ")
-				.append("  LEFT JOIN measureddata md ON m.measure_id = md.measure_id ")
-				.append("  LEFT JOIN measureattribute ma ON md.measureddata_id = ma.measureddata_id ")
-				.append("  WHERE ").append(whereStr).append(") ")
-				.append("SELECT devicename, groupname, samplename, operator, positionname, dataname, datavalue, attributename, attributevalue, updated ")
-				.append("FROM RankedData WHERE rn = 1 ").append("ORDER BY updated DESC");
+		sql.append("SELECT DISTINCT ").append("m.measure_id, ").append("COALESCE(m.slideid, '') as slideid, ")
+				.append("COALESCE(m.devicename, '') as devicename, ").append("COALESCE(m.groupname, '') as groupname, ")
+				.append("COALESCE(m.samplename, '') as samplename, ").append("COALESCE(m.operator, '') as operator, ")
+				.append("COALESCE(m.positionname, '') as positionname, ")
+				.append("COALESCE(md.dataname, '') as dataname, ").append("md.datavalue, ")
+				.append("COALESCE(ma.attributename, '') as attributename, ")
+				.append("COALESCE(ma.attributevalue, '') as attributevalue, ").append("m.updated ")
+				.append("FROM measure m ").append("INNER JOIN measureddata md ON m.measure_id = md.measure_id ")
+				.append("LEFT JOIN measureattribute ma ON md.measureddata_id = ma.measureddata_id ").append("WHERE ")
+				.append(whereStr).append(" ORDER BY m.measure_id");
 
 		return sql.toString();
 	}
@@ -143,122 +144,234 @@ public class ZYGOReportProcess extends SvrProcess {
 		CellStyle headerStyle = createHeaderStyle(workbook);
 		CellStyle basicStyle = createBasicStyle(workbook);
 		CellStyle numberStyle = createNumberStyle(workbook);
+		CellStyle groupHeaderStyle = createGroupHeaderStyle(workbook);
 
-		// 創建表頭
-		Row headerRow = sheet.createRow(0);
-		for (int i = 0; i < headers.length; i++) {
-			Cell cell = headerRow.createCell(i);
-			cell.setCellValue(headers[i]);
-			cell.setCellStyle(headerStyle);
+		Map<String, SlideData> slideDataMap = new TreeMap<>(Comparator.nullsLast(String::compareTo));
+
+		try (PreparedStatement pstmt = DB.prepareStatement(createSQL(), get_TrxName());
+				ResultSet rs = pstmt.executeQuery()) {
+
+			while (rs.next()) {
+				String slideId = rs.getString("slideid") != null ? rs.getString("slideid") : "";
+				String measureId = rs.getString("measure_id");
+
+				SlideData slideData = slideDataMap.computeIfAbsent(slideId, k -> {
+					SlideData data = new SlideData();
+					try {
+						data.operator = rs.getString("operator") != null ? rs.getString("operator") : "";
+						data.groupName = rs.getString("groupname") != null ? rs.getString("groupname") : "";
+						data.sampleName = rs.getString("samplename") != null ? rs.getString("samplename") : "";
+					} catch (SQLException e) {
+						e.printStackTrace();
+					}
+					return data;
+				});
+
+				String positionName = rs.getString("positionname");
+				String dataName = rs.getString("dataname");
+				String dataValue = rs.getString("datavalue");
+
+				if (positionName != null && !positionName.trim().isEmpty() && dataName != null
+						&& !dataName.trim().isEmpty()) {
+					slideData.addMeasurement(positionName, measureId, dataName, dataValue);
+				}
+
+				String attrName = rs.getString("attributename");
+				String attrValue = rs.getString("attributevalue");
+				if (attrName != null && !attrName.trim().isEmpty()) {
+					slideData.attributes.put(attrName, attrValue);
+				}
+			}
 		}
 
-		PreparedStatement pstmt = null;
-		ResultSet rs = null;
-		int currentRow = 1;
-		int totalRows = 0;
+		// 生成報表
+		int rowNum = 0;
 
-		try {
-			// 首先獲取總行數
-			String countSql = "SELECT COUNT(*) FROM (" + createSQL() + ") as total";
-			pstmt = DB.prepareStatement(countSql, get_TrxName());
-			rs = pstmt.executeQuery();
-			if (rs.next()) {
-				totalRows = rs.getInt(1);
+		// 對每個 slide 生成區塊
+		for (Map.Entry<String, SlideData> slideEntry : slideDataMap.entrySet()) {
+			String slideId = slideEntry.getKey();
+			SlideData data = slideEntry.getValue();
+			int dataNameCount = data.getDataNames().size();
+
+			int mergeColumns;
+			if (dataNameCount <= 2) {
+				mergeColumns = 2; // 確保至少合併到第二欄
+			} else {
+				mergeColumns = dataNameCount - 1; //
 			}
-			DB.close(rs, pstmt);
 
-			String batchSql = createSQL() + " OFFSET ? LIMIT ?";
+			// Slide ID 標題列
+			Row slideRow = sheet.createRow(rowNum++);
+			Cell slideCell = slideRow.createCell(0);
+			slideCell.setCellValue("slideid");
+			slideCell.setCellStyle(headerStyle);
+			Cell slideValueCell = slideRow.createCell(1);
+			slideValueCell.setCellValue(slideId);
+			slideValueCell.setCellStyle(groupHeaderStyle);
 
-			for (int offset = 0; offset < totalRows; offset += BATCH_SIZE) {
-				pstmt = DB.prepareStatement(batchSql, get_TrxName());
-				pstmt.setInt(1, offset);
-				pstmt.setInt(2, BATCH_SIZE);
-				rs = pstmt.executeQuery();
+			sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 1, mergeColumns));
 
-				List<String[]> batchData = new ArrayList<>();
+			// 基本資訊
+			createInfoRow(sheet, rowNum++, "操作者", data.operator, basicStyle, headerStyle, mergeColumns);
+			createInfoRow(sheet, rowNum++, "groupName", data.groupName, basicStyle, headerStyle, mergeColumns);
 
-				// 讀取這一批的數據
-				while (rs.next()) {
-					String[] rowData = new String[10]; // 改為10，因為現在有10個欄位
-					rowData[0] = rs.getString("devicename") != null ? rs.getString("devicename") : "";
-					rowData[1] = rs.getString("groupname") != null ? rs.getString("groupname") : "";
-					rowData[2] = rs.getString("samplename") != null ? rs.getString("samplename") : "";
-					rowData[3] = rs.getString("operator") != null ? rs.getString("operator") : "";
-					rowData[4] = rs.getString("positionname") != null ? rs.getString("positionname") : "";
-					rowData[5] = rs.getString("dataname") != null ? rs.getString("dataname") : "";
-					rowData[6] = rs.getBigDecimal("datavalue") != null ? rs.getBigDecimal("datavalue").toString() : "0";
-					rowData[7] = rs.getString("attributename") != null ? rs.getString("attributename") : "";
-					rowData[8] = rs.getString("attributevalue") != null ? rs.getString("attributevalue") : "";
-					rowData[9] = rs.getString("updated") != null ? rs.getString("updated") : ""; // 修正這行
-					batchData.add(rowData);
-				}
-				DB.close(rs, pstmt);
+			// 屬性資訊
+			for (Map.Entry<String, String> attr : data.attributes.entrySet()) {
 
-				// 處理這一批數據
-				for (int i = 0; i < batchData.size(); i++) {
-					Row row = sheet.createRow(currentRow + i);
-					String[] currentRowData = batchData.get(i);
+				createInfoRow(sheet, rowNum++, attr.getKey(), attr.getValue(), basicStyle, headerStyle, mergeColumns);
 
-					// 填充每個儲存格
-					for (int j = 0; j < currentRowData.length; j++) {
-						Cell cell = row.createCell(j);
-						// 處理數值欄位
-						if (j == 6 && currentRowData[j] != null) {
+			}
+
+			// 空白行
+			rowNum++;
+
+			// SampleName
+			Row sampleRow = sheet.createRow(rowNum++);
+			Cell sampleCell = sampleRow.createCell(0);
+			sampleCell.setCellValue("SampleName");
+			sampleCell.setCellStyle(headerStyle);
+			Cell sampleValueCell = sampleRow.createCell(1);
+			sampleValueCell.setCellValue(data.sampleName);
+			sampleValueCell.setCellStyle(basicStyle);
+			if (mergeColumns > 0) {
+				sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 1, mergeColumns));
+			}
+			// DataName 標題行
+			Row dataNameRow = sheet.createRow(rowNum++);
+			int colNum = 1;
+			for (String dataName : data.getDataNames()) {
+				Cell cell = dataNameRow.createCell(colNum++);
+				cell.setCellValue(dataName);
+				cell.setCellStyle(headerStyle);
+			}
+
+			// 修改數據部分的生成邏輯
+			for (String position : data.getPositions()) {
+				// 獲取該位置的所有 measure_id
+				Set<String> measureIds = data.getMeasureIds(position);
+
+				// 為每個 measure_id 生成一行
+				for (String measureId : measureIds) {
+					Row row = sheet.createRow(rowNum++);
+
+					// 每行都顯示位置編號
+					Cell posCell = row.createCell(0);
+					posCell.setCellValue(position);
+					posCell.setCellStyle(headerStyle);
+
+					int colNumcount = 1;
+					for (String dataName : data.getDataNames()) {
+						Cell cell = row.createCell(colNumcount++);
+						String value = data.getMeasurementValue(position, measureId, dataName);
+						if (value != null && !value.isEmpty()) {
 							try {
-								cell.setCellValue(Double.parseDouble(currentRowData[j]));
+								double numValue = Double.parseDouble(value);
+								cell.setCellValue(numValue);
 								cell.setCellStyle(numberStyle);
 							} catch (NumberFormatException e) {
-								cell.setCellValue(currentRowData[j]);
+								cell.setCellValue(value);
 								cell.setCellStyle(basicStyle);
 							}
-						} else {
-							cell.setCellValue(currentRowData[j]);
-							cell.setCellStyle(basicStyle);
 						}
 					}
 				}
-
-				// 合併相同值的儲存格
-				for (int j = 0; j < headers.length; j++) {
-					int startRow = currentRow;
-					int endRow = currentRow;
-
-					for (int i = 1; i < batchData.size(); i++) {
-						String currentValue = batchData.get(i - 1)[j];
-						String nextValue = batchData.get(i)[j];
-
-						if (currentValue.equals(nextValue)) {
-							endRow = currentRow + i;
-						} else {
-							if (startRow < endRow) {
-								sheet.addMergedRegion(new CellRangeAddress(startRow, endRow, j, j));
-							}
-							startRow = currentRow + i;
-							endRow = currentRow + i;
-						}
-					}
-
-					// 合併最後一段
-					if (startRow < endRow) {
-						sheet.addMergedRegion(new CellRangeAddress(startRow, endRow, j, j));
-					}
-				}
-
-				currentRow += batchData.size();
-				batchData.clear();
 			}
 
-			// 自動調整欄寬
-			for (int i = 0; i < headers.length; i++) {
-				sheet.autoSizeColumn(i);
-			}
-
-			// 設置凍結窗格
-			sheet.createFreezePane(0, 1);
-
-		} finally {
-			DB.close(rs, pstmt);
+			// 群組之間的空白行
+			rowNum += 2;
 		}
+
+		// 自動調整欄寬
+		for (int i = 0; i < 7; i++) {
+			sheet.autoSizeColumn(i);
+		}
+
+		// 設置凍結窗格
+		sheet.createFreezePane(1, 1);
+	}
+
+// 輔助類別用於組織數據
+	private static class SlideData {
+		String operator = "";
+		String groupName = "";
+		String sampleName = "";
+		Map<String, String> attributes = new TreeMap<>();
+
+		// 使用自定義 Comparator 的 TreeMap
+		Map<String, Map<String, Map<String, String>>> measurements = new TreeMap<>((a, b) -> {
+			try {
+				int numA = Integer.parseInt(a);
+				int numB = Integer.parseInt(b);
+				return Integer.compare(numA, numB);
+			} catch (NumberFormatException e) {
+				return a.compareTo(b);
+			}
+		});
+		Set<String> dataNames = new TreeSet<>();
+
+		void addMeasurement(String position, String measureId, String dataName, String value) {
+			measurements.computeIfAbsent(position, k -> new TreeMap<>())
+					.computeIfAbsent(measureId, k -> new TreeMap<>()).put(dataName, value != null ? value : "");
+			dataNames.add(dataName);
+		}
+
+		Set<String> getPositions() {
+			return measurements.keySet();
+		}
+
+		Set<String> getDataNames() {
+			return dataNames;
+		}
+
+		Set<String> getMeasureIds(String position) {
+			Map<String, Map<String, String>> posData = measurements.get(position);
+			return posData != null ? posData.keySet() : new TreeSet<>();
+		}
+
+		String getMeasurementValue(String position, String measureId, String dataName) {
+			Map<String, Map<String, String>> posData = measurements.get(position);
+			if (posData != null) {
+				Map<String, String> measureData = posData.get(measureId);
+				if (measureData != null) {
+					return measureData.getOrDefault(dataName, "");
+				}
+			}
+			return "";
+		}
+	}
+
+// 輔助方法用於創建資訊行
+	private void createInfoRow(XSSFSheet sheet, int rowNum, String label, String value, CellStyle basicStyle,
+			CellStyle headerStyle, int dataNameCount) {
+		Row row = sheet.createRow(rowNum);
+		Cell labelCell = row.createCell(0);
+		labelCell.setCellValue(label);
+		labelCell.setCellStyle(headerStyle);
+		Cell valueCell = row.createCell(1);
+		valueCell.setCellValue(value);
+		valueCell.setCellStyle(basicStyle);
+		// 合併儲存格數量改為 dataNameCount + 1
+		sheet.addMergedRegion(new CellRangeAddress(rowNum, rowNum, 1, dataNameCount + 1));
+	}
+
+// 群組標題樣式
+	private CellStyle createGroupHeaderStyle(XSSFWorkbook workbook) {
+		CellStyle style = workbook.createCellStyle();
+		style.setFillForegroundColor(IndexedColors.GREY_25_PERCENT.getIndex());
+		style.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+		style.setBorderBottom(BorderStyle.THIN);
+		style.setBorderTop(BorderStyle.THIN);
+		style.setBorderLeft(BorderStyle.THIN);
+		style.setBorderRight(BorderStyle.THIN);
+		style.setAlignment(HorizontalAlignment.LEFT);
+		style.setVerticalAlignment(VerticalAlignment.CENTER);
+
+		Font font = workbook.createFont();
+		font.setFontName("微軟正黑體");
+		font.setBold(true);
+		style.setFont(font);
+
+		return style;
 	}
 
 	private CellStyle createHeaderStyle(XSSFWorkbook workbook) {
