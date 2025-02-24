@@ -148,12 +148,22 @@ public class ZYGOReportProcess extends SvrProcess {
 
 		Map<String, SlideData> slideDataMap = new TreeMap<>(Comparator.nullsLast(String::compareTo));
 
+		// 收集數據部分
 		try (PreparedStatement pstmt = DB.prepareStatement(createSQL(), get_TrxName());
 				ResultSet rs = pstmt.executeQuery()) {
+
+			String currentMeasureId = null;
+			Map<String, String> currentAttributes = new TreeMap<>();
 
 			while (rs.next()) {
 				String slideId = rs.getString("slideid") != null ? rs.getString("slideid") : "";
 				String measureId = rs.getString("measure_id");
+				Timestamp updated = rs.getTimestamp("updated");
+
+				if (currentMeasureId == null || !currentMeasureId.equals(measureId)) {
+					currentAttributes.clear();
+					currentMeasureId = measureId;
+				}
 
 				SlideData slideData = slideDataMap.computeIfAbsent(slideId, k -> {
 					SlideData data = new SlideData();
@@ -167,19 +177,20 @@ public class ZYGOReportProcess extends SvrProcess {
 					return data;
 				});
 
+				String attrName = rs.getString("attributename");
+				String attrValue = rs.getString("attributevalue");
+				if (attrName != null && !attrName.trim().isEmpty()) {
+					currentAttributes.put(attrName, attrValue);
+				}
+
 				String positionName = rs.getString("positionname");
 				String dataName = rs.getString("dataname");
 				String dataValue = rs.getString("datavalue");
 
 				if (positionName != null && !positionName.trim().isEmpty() && dataName != null
 						&& !dataName.trim().isEmpty()) {
-					slideData.addMeasurement(positionName, measureId, dataName, dataValue);
-				}
-
-				String attrName = rs.getString("attributename");
-				String attrValue = rs.getString("attributevalue");
-				if (attrName != null && !attrName.trim().isEmpty()) {
-					slideData.attributes.put(attrName, attrValue);
+					slideData.addMeasurement(positionName, measureId, dataName, dataValue,
+							new TreeMap<>(currentAttributes));
 				}
 			}
 		}
@@ -191,97 +202,46 @@ public class ZYGOReportProcess extends SvrProcess {
 		for (Map.Entry<String, SlideData> slideEntry : slideDataMap.entrySet()) {
 			String slideId = slideEntry.getKey();
 			SlideData data = slideEntry.getValue();
-			int dataNameCount = data.getDataNames().size();
 
-			int mergeColumns;
-			if (dataNameCount <= 2) {
-				mergeColumns = 2; // 確保至少合併到第二欄
-			} else {
-				mergeColumns = dataNameCount - 1; //
-			}
+			// 對每個屬性組合生成獨立的數據區塊
+			for (Map.Entry<String, SlideData.GroupData> groupEntry : data.attributeGroups.entrySet()) {
+				SlideData.GroupData groupData = groupEntry.getValue();
 
-			// Slide ID 標題列
-			Row slideRow = sheet.createRow(rowNum++);
-			Cell slideCell = slideRow.createCell(0);
-			slideCell.setCellValue("slideid");
-			slideCell.setCellStyle(headerStyle);
-			Cell slideValueCell = slideRow.createCell(1);
-			slideValueCell.setCellValue(slideId);
-			slideValueCell.setCellStyle(groupHeaderStyle);
+				int mergeColumns = Math.max(groupData.dataNames.size(), 2); // 最少合併到第2列
 
-			sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 1, mergeColumns));
-
-			// 基本資訊
-			createInfoRow(sheet, rowNum++, "操作者", data.operator, basicStyle, headerStyle, mergeColumns);
-			createInfoRow(sheet, rowNum++, "groupName", data.groupName, basicStyle, headerStyle, mergeColumns);
-
-			// 屬性資訊
-			for (Map.Entry<String, String> attr : data.attributes.entrySet()) {
-
-				createInfoRow(sheet, rowNum++, attr.getKey(), attr.getValue(), basicStyle, headerStyle, mergeColumns);
-
-			}
-
-			// 空白行
-			rowNum++;
-
-			// SampleName
-			Row sampleRow = sheet.createRow(rowNum++);
-			Cell sampleCell = sampleRow.createCell(0);
-			sampleCell.setCellValue("SampleName");
-			sampleCell.setCellStyle(headerStyle);
-			Cell sampleValueCell = sampleRow.createCell(1);
-			sampleValueCell.setCellValue(data.sampleName);
-			sampleValueCell.setCellStyle(basicStyle);
-			if (mergeColumns > 0) {
+				// Slide ID 標題列
+				Row slideRow = sheet.createRow(rowNum++);
+				Cell slideCell = slideRow.createCell(0);
+				slideCell.setCellValue("Slide_id");
+				slideCell.setCellStyle(headerStyle);
+				Cell slideValueCell = slideRow.createCell(1);
+				slideValueCell.setCellValue(slideId);
+				slideValueCell.setCellStyle(groupHeaderStyle);
 				sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 1, mergeColumns));
-			}
-			// DataName 標題行
-			Row dataNameRow = sheet.createRow(rowNum++);
-			int colNum = 1;
-			for (String dataName : data.getDataNames()) {
-				Cell cell = dataNameRow.createCell(colNum++);
-				cell.setCellValue(dataName);
-				cell.setCellStyle(headerStyle);
-			}
 
-			// 修改數據部分的生成邏輯
-			for (String position : data.getPositions()) {
-				// 獲取該位置的所有 measure_id
-				Set<String> measureIds = data.getMeasureIds(position);
+				// 基本信息
+				createInfoRow(sheet, rowNum++, "操作者", data.operator, basicStyle, headerStyle, mergeColumns);
+				createInfoRow(sheet, rowNum++, "groupName", data.groupName, basicStyle, headerStyle, mergeColumns);
 
-				// 為每個 measure_id 生成一行
-				for (String measureId : measureIds) {
-					Row row = sheet.createRow(rowNum++);
-
-					// 每行都顯示位置編號
-					Cell posCell = row.createCell(0);
-					posCell.setCellValue(position);
-					posCell.setCellStyle(headerStyle);
-
-					int colNumcount = 1;
-					for (String dataName : data.getDataNames()) {
-						Cell cell = row.createCell(colNumcount++);
-						String value = data.getMeasurementValue(position, measureId, dataName);
-						if (value != null && !value.isEmpty()) {
-							try {
-								double numValue = Double.parseDouble(value);
-								cell.setCellValue(numValue);
-								cell.setCellStyle(numberStyle);
-							} catch (NumberFormatException e) {
-								cell.setCellValue(value);
-								cell.setCellStyle(basicStyle);
-							}
-						}
-					}
+				// 屬性信息
+				for (Map.Entry<String, String> attr : groupData.attributes.entrySet()) {
+					createInfoRow(sheet, rowNum++, attr.getKey(), attr.getValue(), basicStyle, headerStyle,
+							mergeColumns);
 				}
-			}
 
-			// 群組之間的空白行
-			rowNum += 2;
+				// 空白行
+				rowNum++;
+
+				// 生成數據表格
+				rowNum = generateDataTable(sheet, rowNum, groupData, data.sampleName, headerStyle, basicStyle,
+						numberStyle, mergeColumns);
+
+				// 組之間添加兩個空白行
+				rowNum += 2;
+			}
 		}
 
-		// 自動調整欄寬
+		// 自動調整列寬
 		for (int i = 0; i < 7; i++) {
 			sheet.autoSizeColumn(i);
 		}
@@ -290,68 +250,128 @@ public class ZYGOReportProcess extends SvrProcess {
 		sheet.createFreezePane(1, 1);
 	}
 
+	// 修改 generateDataTable 方法
+	private int generateDataTable(XSSFSheet sheet, int startRow, SlideData.GroupData groupData, String sampleName,
+			CellStyle headerStyle, CellStyle basicStyle, CellStyle numberStyle, int mergeColumns) {
+		int rowNum = startRow;
+
+		// SampleName 行
+		Row sampleRow = sheet.createRow(rowNum++);
+		Cell sampleCell = sampleRow.createCell(0);
+		sampleCell.setCellValue("SampleName");
+		sampleCell.setCellStyle(headerStyle);
+		Cell sampleValueCell = sampleRow.createCell(1);
+		sampleValueCell.setCellValue(sampleName);
+		sampleValueCell.setCellStyle(basicStyle);
+		sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 1, mergeColumns));
+
+		// DataName 標題行
+		Row dataNameRow = sheet.createRow(rowNum++);
+		int colNum = 1;
+		for (String dataName : groupData.dataNames) {
+			Cell cell = dataNameRow.createCell(colNum++);
+			cell.setCellValue(dataName);
+			cell.setCellStyle(headerStyle);
+		}
+
+		// 數據行
+		for (String position : groupData.measurements.keySet()) {
+			for (Map.Entry<String, Map<String, String>> measureEntry : groupData.measurements.get(position)
+					.entrySet()) {
+				Row row = sheet.createRow(rowNum++);
+
+				// 位置編號
+				Cell posCell = row.createCell(0);
+				posCell.setCellValue(position);
+				posCell.setCellStyle(headerStyle);
+
+				// 數據值
+				colNum = 1;
+				for (String dataName : groupData.dataNames) {
+					Cell cell = row.createCell(colNum++);
+					String value = measureEntry.getValue().get(dataName);
+					if (value != null && !value.isEmpty()) {
+						try {
+							double numValue = Double.parseDouble(value);
+							cell.setCellValue(numValue);
+							cell.setCellStyle(numberStyle);
+						} catch (NumberFormatException e) {
+							cell.setCellValue(value);
+							cell.setCellStyle(basicStyle);
+						}
+					}
+				}
+			}
+		}
+
+		return rowNum;
+	}
+
+//修改 createInfoRow 方法以支持合併儲存格
+	// 創建信息行的方法確保參數正確
+	private void createInfoRow(XSSFSheet sheet, int rowNum, String label, String value, CellStyle basicStyle,
+			CellStyle headerStyle, int mergeColumns) {
+		Row row = sheet.createRow(rowNum);
+		Cell labelCell = row.createCell(0);
+		labelCell.setCellValue(label);
+		labelCell.setCellStyle(headerStyle);
+
+		Cell valueCell = row.createCell(1);
+		valueCell.setCellValue(value);
+		valueCell.setCellStyle(basicStyle);
+
+		sheet.addMergedRegion(new CellRangeAddress(rowNum, rowNum, 1, mergeColumns));
+	}
+
 // 輔助類別用於組織數據
 	private static class SlideData {
 		String operator = "";
 		String groupName = "";
 		String sampleName = "";
-		Map<String, String> attributes = new TreeMap<>();
 
-		// 使用自定義 Comparator 的 TreeMap
-		Map<String, Map<String, Map<String, String>>> measurements = new TreeMap<>((a, b) -> {
-			try {
-				int numA = Integer.parseInt(a);
-				int numB = Integer.parseInt(b);
-				return Integer.compare(numA, numB);
-			} catch (NumberFormatException e) {
-				return a.compareTo(b);
-			}
-		});
-		Set<String> dataNames = new TreeSet<>();
-
-		void addMeasurement(String position, String measureId, String dataName, String value) {
-			measurements.computeIfAbsent(position, k -> new TreeMap<>())
-					.computeIfAbsent(measureId, k -> new TreeMap<>()).put(dataName, value != null ? value : "");
-			dataNames.add(dataName);
-		}
-
-		Set<String> getPositions() {
-			return measurements.keySet();
-		}
-
-		Set<String> getDataNames() {
-			return dataNames;
-		}
-
-		Set<String> getMeasureIds(String position) {
-			Map<String, Map<String, String>> posData = measurements.get(position);
-			return posData != null ? posData.keySet() : new TreeSet<>();
-		}
-
-		String getMeasurementValue(String position, String measureId, String dataName) {
-			Map<String, Map<String, String>> posData = measurements.get(position);
-			if (posData != null) {
-				Map<String, String> measureData = posData.get(measureId);
-				if (measureData != null) {
-					return measureData.getOrDefault(dataName, "");
+		// 用於存儲不同屬性組合的數據
+		static class GroupData {
+			Map<String, String> attributes = new TreeMap<>();
+			Map<String, Map<String, Map<String, String>>> measurements = new TreeMap<>((a, b) -> {
+				try {
+					int numA = Integer.parseInt(a);
+					int numB = Integer.parseInt(b);
+					return Integer.compare(numA, numB);
+				} catch (NumberFormatException e) {
+					return a.compareTo(b);
 				}
-			}
-			return "";
+			});
+			Set<String> dataNames = new TreeSet<>();
 		}
-	}
 
-// 輔助方法用於創建資訊行
-	private void createInfoRow(XSSFSheet sheet, int rowNum, String label, String value, CellStyle basicStyle,
-			CellStyle headerStyle, int dataNameCount) {
-		Row row = sheet.createRow(rowNum);
-		Cell labelCell = row.createCell(0);
-		labelCell.setCellValue(label);
-		labelCell.setCellStyle(headerStyle);
-		Cell valueCell = row.createCell(1);
-		valueCell.setCellValue(value);
-		valueCell.setCellStyle(basicStyle);
-		// 合併儲存格數量改為 dataNameCount + 1
-		sheet.addMergedRegion(new CellRangeAddress(rowNum, rowNum, 1, dataNameCount + 1));
+		// 用於存儲不同的屬性組合組
+		Map<String, GroupData> attributeGroups = new TreeMap<>();
+
+		// 生成屬性組合的唯一標識符
+		private String generateGroupKey(Map<String, String> attributes, String operator, String groupName) {
+			StringBuilder key = new StringBuilder();
+			key.append(operator).append("_").append(groupName);
+			for (Map.Entry<String, String> entry : attributes.entrySet()) {
+				key.append("_").append(entry.getKey()).append("=").append(entry.getValue());
+			}
+			return key.toString();
+		}
+
+		// 添加測量數據
+		void addMeasurement(String position, String measureId, String dataName, String value,
+				Map<String, String> currentAttributes) {
+			String groupKey = generateGroupKey(currentAttributes, operator, groupName);
+
+			GroupData groupData = attributeGroups.computeIfAbsent(groupKey, k -> {
+				GroupData newGroup = new GroupData();
+				newGroup.attributes.putAll(currentAttributes);
+				return newGroup;
+			});
+
+			groupData.measurements.computeIfAbsent(position, k -> new TreeMap<>())
+					.computeIfAbsent(measureId, k -> new TreeMap<>()).put(dataName, value != null ? value : "");
+			groupData.dataNames.add(dataName);
+		}
 	}
 
 // 群組標題樣式
