@@ -6,12 +6,12 @@ import java.sql.ResultSet;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.Set;
 
 import org.apache.poi.ss.usermodel.BorderStyle;
 import org.apache.poi.ss.usermodel.Cell;
@@ -274,14 +274,16 @@ public class PSZYGOReportProcess extends SvrProcess {
 		}
 
 		// 3. 獲取測量數據
-		// 保存每個slideId下的measureId列表
-		Map<String, List<String>> slideMeasureIdsMap = new HashMap<>();
-
-		// 結構: slideId -> positionName -> measureId -> {dataName -> dataValue}
-		Map<String, Map<String, Map<String, List<String>>>> measurementDataMap = new HashMap<>();
+		// 結構: slideId -> HT-DOM-Key -> positionName -> dataName -> value
+		// 改進 1: 在數據讀取部分加入更多檢查和日誌
+		Map<String, Map<String, Map<String, Map<String, String>>>> reorganizedData = new HashMap<>();
+		Map<String, List<String>> slideHtDomKeysMap = new HashMap<>();
 
 		try (PreparedStatement pstmt = DB.prepareStatement(createMeasurementDataSQL(), get_TrxName());
 				ResultSet rs = pstmt.executeQuery()) {
+
+			// 收集所有數據并存儲到臨時結構中
+			Map<String, Map<String, Map<String, Map<String, String>>>> rawData = new HashMap<>();
 
 			while (rs.next()) {
 				String slideId = rs.getString("slideid") != null ? rs.getString("slideid") : "";
@@ -290,48 +292,407 @@ public class PSZYGOReportProcess extends SvrProcess {
 				String dataName = rs.getString("dataname");
 				String dataValue = rs.getString("datavalue") != null ? rs.getString("datavalue") : "";
 
-				// 保存measureId列表（保持順序）
-				List<String> measureIds = slideMeasureIdsMap.computeIfAbsent(slideId, k -> new ArrayList<>());
-				if (!measureIds.contains(measureId)) {
-					measureIds.add(measureId);
+				// 存儲原始數據
+				Map<String, Map<String, Map<String, String>>> measureMap = rawData.computeIfAbsent(slideId,
+						k -> new HashMap<>());
+				Map<String, Map<String, String>> positionMap = measureMap.computeIfAbsent(measureId,
+						k -> new HashMap<>());
+				Map<String, String> dataMap = positionMap.computeIfAbsent(positionName, k -> new HashMap<>());
+				dataMap.put(dataName, dataValue);
+				dataMap.put("measure_id", measureId); // 保存measure_id便於後續參考
+			}
+
+			log.info("原始數據收集完成，重組為HT-DOM結構");
+
+			// 為每個slideId處理HT-DOM分組
+			for (String slideId : rawData.keySet()) {
+				Map<String, Map<String, Map<String, String>>> measureMap = rawData.get(slideId);
+
+				// 為這個slideId創建一個measureId到HT-DOM鍵的映射
+				Map<String, String> measureToHtDomMap = new HashMap<>();
+
+				// 首先，獲取每個measureId的HT-DOM值並分組
+				for (String measureId : measureMap.keySet()) {
+					Map<String, Map<String, String>> htDomMapForSlide = htDomMap.getOrDefault(slideId, new HashMap<>());
+					Map<String, String> htDomValues = htDomMapForSlide.getOrDefault(measureId, new HashMap<>());
+					String ht = htDomValues.getOrDefault("HT", "100.0");
+					String dom = htDomValues.getOrDefault("DOM", "");
+					String htDomKey = ht + "-" + dom;
+
+					measureToHtDomMap.put(measureId, htDomKey);
+
+					// 記錄這個slideId的所有HT-DOM鍵
+					List<String> htDomKeys = slideHtDomKeysMap.computeIfAbsent(slideId, k -> new ArrayList<>());
+					if (!htDomKeys.contains(htDomKey)) {
+						htDomKeys.add(htDomKey);
+					}
 				}
 
-				// 新數據結構：slideId -> position -> dataName -> [measure1_value, measure2_value...]
-				Map<String, Map<String, List<String>>> positionMap = measurementDataMap.computeIfAbsent(slideId,
-						k -> new TreeMap<>(Comparator.comparingInt(a -> {
-							try {
-								return Integer.parseInt(a);
-							} catch (NumberFormatException e) {
-								return 0;
-							}
-						})));
+				// 對HT-DOM鍵進行排序 (HT降序，DOM升序)
+				List<String> htDomKeys = slideHtDomKeysMap.get(slideId);
+				Collections.sort(htDomKeys, (a, b) -> {
+					String[] partsA = a.split("-");
+					String[] partsB = b.split("-");
 
-				Map<String, List<String>> dataNameMap = positionMap.computeIfAbsent(positionName,
+					double htA = 0, htB = 0;
+					try {
+						htA = Double.parseDouble(partsA[0]);
+						htB = Double.parseDouble(partsB[0]);
+					} catch (NumberFormatException e) {
+						log.warning("無法解析HT值: " + e.getMessage());
+					}
+
+					// 先按HT降序排列
+					int htCompare = Double.compare(htB, htA);
+					if (htCompare != 0)
+						return htCompare;
+
+					// 如果HT相同，按DOM升序排列
+					String domA = partsA.length > 1 ? partsA[1] : "";
+					String domB = partsB.length > 1 ? partsB[1] : "";
+					return domA.compareTo(domB);
+				});
+
+				log.info("SlideID: " + slideId + " 的HT-DOM鍵排序後: " + htDomKeys);
+
+				// 根據排序後的HT-DOM鍵重組數據
+				Map<String, Map<String, Map<String, String>>> htDomMapData = reorganizedData.computeIfAbsent(slideId,
 						k -> new LinkedHashMap<>());
-				List<String> values = dataNameMap.computeIfAbsent(dataName, k -> new ArrayList<>());
-				values.add(dataValue); // 按measureId順序存儲
+
+				// 預先為所有HT-DOM鍵創建空Map，確保順序與排序一致
+				for (String htDomKey : htDomKeys) {
+					htDomMapData.put(htDomKey, new HashMap<>());
+				}
+
+				// 填充HT-DOM數據結構
+				for (String measureId : measureMap.keySet()) {
+					String htDomKey = measureToHtDomMap.get(measureId);
+					Map<String, Map<String, String>> positionMap = measureMap.get(measureId);
+
+					// 獲取此HT-DOM鍵對應的位置Map
+					Map<String, Map<String, String>> htDomPositionMap = htDomMapData.get(htDomKey);
+
+					for (String positionName : positionMap.keySet()) {
+						Map<String, String> dataMap = positionMap.get(positionName);
+						Map<String, String> existingDataMap = htDomPositionMap.get(positionName);
+
+						if (existingDataMap == null) {
+							// 如果還沒有此position的數據，直接添加
+							htDomPositionMap.put(positionName, new HashMap<>(dataMap));
+						} else {
+							// 如果已有數據，檢查是否要更新
+							String existingMeasureId = existingDataMap.getOrDefault("measure_id", "-1");
+							if (Integer.parseInt(measureId) > Integer.parseInt(existingMeasureId)) {
+								htDomPositionMap.put(positionName, new HashMap<>(dataMap));
+								log.info("更新SlideID: " + slideId + ", HT-DOM: " + htDomKey + ", Position: "
+										+ positionName + ", 從MeasureID " + existingMeasureId + " 到 " + measureId);
+							}
+						}
+					}
+				}
+			}
+
+			// 檢查reorganizedData是否包含所有數據
+			for (String slideId : reorganizedData.keySet()) {
+				Map<String, Map<String, Map<String, String>>> htDomMapData = reorganizedData.get(slideId);
+				log.info("SlideID: " + slideId + " 的HT-DOM數據統計:");
+
+				for (String htDomKey : htDomMapData.keySet()) {
+					Map<String, Map<String, String>> positionMap = htDomMapData.get(htDomKey);
+					log.info("  HT-DOM鍵: " + htDomKey + ", 包含 " + positionMap.size() + " 個position");
+
+					for (String position : positionMap.keySet()) {
+						Map<String, String> dataMap = positionMap.get(position);
+						log.info("    Position " + position + ": 包含 " + dataMap.size() + " 個數據項，MeasureID="
+								+ dataMap.getOrDefault("measure_id", "未知"));
+					}
+				}
 			}
 		}
 
 		// 4. 生成報表
 		int rowNum = 0;
 
-		for (String slideId : slideMeasureIdsMap.keySet()) {
-			List<String> measureIds = slideMeasureIdsMap.get(slideId);
-			Map<String, Map<String, String>> slideAttributes = attributesMap.getOrDefault(slideId, new HashMap<>());
-			Map<String, Map<String, String>> slideHtDom = htDomMap.getOrDefault(slideId, new HashMap<>());
-			Map<String, Map<String, List<String>>> positionsData = measurementDataMap.getOrDefault(slideId,
-					new HashMap<>());
+		for (String slideId : reorganizedData.keySet()) {
+			Map<String, Map<String, Map<String, String>>> htDomData = reorganizedData.get(slideId);
+			List<String> htDomKeys = slideHtDomKeysMap.getOrDefault(slideId, new ArrayList<>());
+			Map<String, Map<String, String>> attributesByMeasure = attributesMap.getOrDefault(slideId, new HashMap<>());
 
 			// 空白行分隔不同SlideID
 			if (rowNum > 0) {
 				rowNum += 2;
 			}
 
-			// 生成報表
-			rowNum = createSlideReport(sheet, rowNum, slideId, measureIds, slideAttributes, slideHtDom, positionsData,
+			// 計算真正需要的列數
+			int columnCount = htDomKeys.size() * 2 + 1; // 每個HT-DOM組佔2列(X和Y)
+
+			// 為此SlideID創建報表
+			rowNum = createSlideReportNew(sheet, rowNum, slideId, htDomKeys, htDomData, attributesByMeasure,
 					headerStyle, basicStyle, numberStyle, orangeStyle, blueStyle);
 		}
+	}
+
+	// 為單個SlideID生成完整報表（使用新的數據結構）
+	private int createSlideReportNew(XSSFSheet sheet, int rowNum, String slideId, List<String> htDomKeys,
+			Map<String, Map<String, Map<String, String>>> htDomData,
+			Map<String, Map<String, String>> attributesByMeasure, CellStyle headerStyle, CellStyle basicStyle,
+			CellStyle numberStyle, CellStyle orangeStyle, CellStyle blueStyle) {
+
+		int startRow = rowNum;
+		int columnCount = htDomKeys.size() * 2 + 1; // 每個HT-DOM組佔2列(X和Y)
+
+		// 1. 創建Item行
+		Row itemRow = sheet.createRow(rowNum++);
+		Cell itemLabelCell = itemRow.createCell(0);
+		itemLabelCell.setCellValue("Item");
+		itemLabelCell.setCellStyle(headerStyle);
+
+		Cell itemValueCell = itemRow.createCell(1);
+		itemValueCell.setCellValue(slideId);
+		itemValueCell.setCellStyle(basicStyle);
+
+		// 跨列合併Item值
+		if (htDomKeys.size() > 1) {
+			sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 1, columnCount - 1));
+			// 設置每個格子的樣式
+			for (int i = 2; i < columnCount; i++) {
+				Cell cell = itemRow.createCell(i);
+				cell.setCellStyle(basicStyle);
+			}
+		}
+
+		// 2. 創建動態屬性行
+		if (!htDomKeys.isEmpty() && !htDomData.isEmpty()) {
+			// 從第一個HT-DOM鍵的第一個position獲取一個measureId
+			String firstHtDomKey = htDomKeys.get(0);
+			Map<String, Map<String, String>> positionData = htDomData.get(firstHtDomKey);
+			String firstPosition = positionData.keySet().iterator().next();
+			String measureId = positionData.get(firstPosition).getOrDefault("measure_id", "");
+
+			if (!measureId.isEmpty()) {
+				// 獲取該measureId的所有屬性
+				Map<String, String> attrs = attributesByMeasure.getOrDefault(measureId, new HashMap<>());
+
+				// 為每個屬性創建一行
+				for (String attrName : attrs.keySet()) {
+					Row attrRow = sheet.createRow(rowNum++);
+					Cell attrLabelCell = attrRow.createCell(0);
+					attrLabelCell.setCellValue(attrName);
+					attrLabelCell.setCellStyle(headerStyle);
+
+					// 為每個HT-DOM組填充屬性值
+					for (int i = 0; i < htDomKeys.size(); i++) {
+						String htDomKey = htDomKeys.get(i);
+						positionData = htDomData.get(htDomKey);
+
+						if (!positionData.isEmpty()) {
+							// 獲取第一個position的measureId
+							String posKey = positionData.keySet().iterator().next();
+							String mid = positionData.get(posKey).getOrDefault("measure_id", "");
+
+							if (!mid.isEmpty()) {
+								// 獲取該measureId的屬性值
+								attrs = attributesByMeasure.getOrDefault(mid, new HashMap<>());
+								String attrValue = attrs.getOrDefault(attrName, "");
+
+								// 選擇樣式（Mask使用藍色）
+								CellStyle valueStyle = attrName.equals("Mask") ? blueStyle : basicStyle;
+
+								// 填充值（每個HT-DOM組佔用2列）
+								Cell attrValueCell = attrRow.createCell(i * 2 + 1);
+								attrValueCell.setCellValue(attrValue);
+								attrValueCell.setCellStyle(valueStyle);
+
+								// 跨兩列合併單元格
+								sheet.addMergedRegion(
+										new CellRangeAddress(rowNum - 1, rowNum - 1, i * 2 + 1, i * 2 + 2));
+
+								// 設置第二列單元格樣式
+								Cell mergedCell = attrRow.createCell(i * 2 + 2);
+								mergedCell.setCellStyle(valueStyle);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 3. 創建HT (%)行
+		Row htRow = sheet.createRow(rowNum++);
+		Cell htLabelCell = htRow.createCell(0);
+		htLabelCell.setCellValue("HT (%)");
+		htLabelCell.setCellStyle(headerStyle);
+
+		// 4. 創建Dom行
+		Row domRow = sheet.createRow(rowNum++);
+		Cell domLabelCell = domRow.createCell(0);
+		domLabelCell.setCellValue("Dom");
+		domLabelCell.setCellStyle(headerStyle);
+
+		log.info("填充SlideID: " + slideId + " 的HT-DOM數據，共 " + htDomKeys.size() + " 組");
+
+		// 填充HT和Dom數據
+		for (int i = 0; i < htDomKeys.size(); i++) {
+			String htDomKey = htDomKeys.get(i);
+			String[] parts = htDomKey.split("-");
+			String ht = parts[0];
+			String dom = parts.length > 1 ? parts[1] : "";
+			log.info("  處理HT-DOM鍵: " + htDomKey + ", HT=" + ht + ", DOM=" + dom);
+
+			// HT值
+			Cell htValueCell = htRow.createCell(i * 2 + 1);
+			htValueCell.setCellValue(ht);
+			htValueCell.setCellStyle(orangeStyle);
+
+			sheet.addMergedRegion(new CellRangeAddress(rowNum - 2, rowNum - 2, i * 2 + 1, i * 2 + 2));
+			Cell htMergedCell = htRow.createCell(i * 2 + 2);
+			htMergedCell.setCellStyle(orangeStyle);
+
+			// Dom值
+			Cell domValueCell = domRow.createCell(i * 2 + 1);
+			domValueCell.setCellValue(dom);
+			domValueCell.setCellStyle(orangeStyle);
+
+			sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, i * 2 + 1, i * 2 + 2));
+			Cell domMergedCell = domRow.createCell(i * 2 + 2);
+			domMergedCell.setCellStyle(orangeStyle);
+		}
+
+		// 5. 創建X/Y行
+		Row xyRow = sheet.createRow(rowNum++);
+		Cell emptyCellXY = xyRow.createCell(0);
+		emptyCellXY.setCellStyle(headerStyle);
+
+		for (int i = 0; i < htDomKeys.size(); i++) {
+			Cell xCell = xyRow.createCell(i * 2 + 1);
+			xCell.setCellValue("X");
+			xCell.setCellStyle(basicStyle);
+
+			Cell yCell = xyRow.createCell(i * 2 + 2);
+			yCell.setCellValue("Y");
+			yCell.setCellStyle(basicStyle);
+		}
+
+		// 6. 獲取所有position並排序
+		Set<String> allPositions = new HashSet<>();
+		for (String htDomKey : htDomKeys) {
+			Map<String, Map<String, String>> positionData = htDomData.getOrDefault(htDomKey, new HashMap<>());
+			allPositions.addAll(positionData.keySet());
+		}
+
+		List<String> positions = new ArrayList<>(allPositions);
+		Collections.sort(positions, (a, b) -> {
+			try {
+				return Integer.compare(Integer.parseInt(a), Integer.parseInt(b));
+			} catch (NumberFormatException e) {
+				return a.compareTo(b);
+			}
+		});
+		log.info("Position排序結果: " + String.join(", ", positions));
+
+		// 7. 創建Position數據部分
+		for (String position : positions) {
+			log.info("處理Position: " + position);
+			// 創建Position標題行
+			Row positionRow = sheet.createRow(rowNum++);
+			Cell positionCell = positionRow.createCell(0);
+			positionCell.setCellValue("Position " + position);
+			positionCell.setCellStyle(headerStyle);
+
+			// 合併標題單元格
+			for (int i = 1; i < columnCount; i++) {
+				Cell cell = positionRow.createCell(i);
+				cell.setCellStyle(headerStyle);
+			}
+			sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 0, columnCount - 1));
+
+			// 創建數據行
+			Row tcdRow = sheet.createRow(rowNum++);
+			Cell tcdLabelCell = tcdRow.createCell(0);
+			tcdLabelCell.setCellValue("TCD");
+			tcdLabelCell.setCellStyle(headerStyle);
+
+			Row bcdRow = sheet.createRow(rowNum++);
+			Cell bcdLabelCell = bcdRow.createCell(0);
+			bcdLabelCell.setCellValue("BCD");
+			bcdLabelCell.setCellStyle(headerStyle);
+
+			Row pshRow = sheet.createRow(rowNum++);
+			Cell pshLabelCell = pshRow.createCell(0);
+			pshLabelCell.setCellValue("PSH");
+			pshLabelCell.setCellStyle(headerStyle);
+
+			Row msRow = sheet.createRow(rowNum++);
+			Cell msLabelCell = msRow.createCell(0);
+			msLabelCell.setCellValue("M-S");
+			msLabelCell.setCellStyle(blueStyle);
+
+			// 為每個HT-DOM組填充數據
+			for (int i = 0; i < htDomKeys.size(); i++) {
+				String htDomKey = htDomKeys.get(i);
+				Map<String, Map<String, String>> positionDataMap = htDomData.getOrDefault(htDomKey, new HashMap<>());
+				Map<String, String> dataMap = positionDataMap.getOrDefault(position, new HashMap<>());
+				log.info("  HT-DOM鍵: " + htDomKey + ", Position: " + position + ", 找到數據: " + !dataMap.isEmpty());
+
+				if (!dataMap.isEmpty()) {
+					log.info("    數據內容: measureId=" + dataMap.getOrDefault("measure_id", "未知") + ", TCD DX="
+							+ dataMap.getOrDefault("TCD DX-95%", "無") + ", TCD DY="
+							+ dataMap.getOrDefault("TCD DY", "無") + ", PS-BOT-DX="
+							+ dataMap.getOrDefault("PS-BOT-DX", "無") + ", PS-BOT-DY="
+							+ dataMap.getOrDefault("PS-BOT-DY", "無") + ", PS-Hp=" + dataMap.getOrDefault("PS-Hp", "無"));
+				}
+				int xCol = i * 2 + 1;
+				int yCol = i * 2 + 2;
+
+				if (!dataMap.isEmpty()) {
+					// 獲取所有需要的數據
+					String tcdX = dataMap.getOrDefault("TCD DX-95%", "");
+					String tcdY = dataMap.getOrDefault("TCD DY", "");
+					String bcdX = dataMap.getOrDefault("PS-BOT-DX", "");
+					String bcdY = dataMap.getOrDefault("PS-BOT-DY", "");
+					String psh = dataMap.getOrDefault("PS-Hp", "");
+
+					log.info("    數據值: TCD DX=" + tcdX + ", TCD DY=" + tcdY + ", PS-BOT-DX=" + bcdX + ", PS-BOT-DY="
+							+ bcdY + ", PS-Hp=" + psh);
+					// 填充TCD數據
+					setNumericCellValue(tcdRow.createCell(xCol), dataMap.getOrDefault("TCD DX-95%", ""), numberStyle);
+					setNumericCellValue(tcdRow.createCell(yCol), dataMap.getOrDefault("TCD DY", ""), numberStyle);
+
+					// 填充BCD數據
+					setNumericCellValue(bcdRow.createCell(xCol), dataMap.getOrDefault("PS-BOT-DX", ""), numberStyle);
+					setNumericCellValue(bcdRow.createCell(yCol), dataMap.getOrDefault("PS-BOT-DY", ""), numberStyle);
+
+					// 填充PSH數據
+					setNumericCellValue(pshRow.createCell(xCol), dataMap.getOrDefault("PS-Hp", ""), numberStyle);
+					pshRow.createCell(yCol).setCellStyle(numberStyle); // Y列保持空白
+				} else {
+					log.info("    沒有找到數據");
+					// 如果沒有數據，填充空單元格
+					tcdRow.createCell(xCol).setCellStyle(numberStyle);
+					tcdRow.createCell(yCol).setCellStyle(numberStyle);
+					bcdRow.createCell(xCol).setCellStyle(numberStyle);
+					bcdRow.createCell(yCol).setCellStyle(numberStyle);
+					pshRow.createCell(xCol).setCellStyle(numberStyle);
+					pshRow.createCell(yCol).setCellStyle(numberStyle);
+				}
+
+				// M-S行數據處理保持不變
+				if (i == 0) {
+					Cell dashCell = msRow.createCell(xCol);
+					dashCell.setCellValue("-");
+					dashCell.setCellStyle(basicStyle);
+
+					Cell zeroCell = msRow.createCell(yCol);
+					zeroCell.setCellValue(0.000);
+					zeroCell.setCellStyle(numberStyle);
+				} else {
+					msRow.createCell(xCol).setCellStyle(basicStyle);
+					msRow.createCell(yCol).setCellStyle(basicStyle);
+				}
+			}
+		}
+
+		return rowNum;
 	}
 
 	// 為單個SlideID生成完整報表
@@ -438,6 +799,9 @@ public class PSZYGOReportProcess extends SvrProcess {
 		domLabelCell.setCellValue("Dom");
 		domLabelCell.setCellStyle(headerStyle);
 
+		log.info("在 SlideID: " + slideId + " 中填充 HT-DOM 數據");
+		log.info("唯一的 HT-DOM 鍵: " + String.join(", ", uniqueHtDomKeys));
+
 		// 填充HT和Dom數據
 		for (int i = 0; i < uniqueHtDomKeys.size(); i++) {
 			String htDomKey = uniqueHtDomKeys.get(i);
@@ -538,7 +902,7 @@ public class PSZYGOReportProcess extends SvrProcess {
 			for (int i = 0; i < uniqueHtDomKeys.size(); i++) {
 				String htDomKey = uniqueHtDomKeys.get(i);
 				List<String> groupMeasureIds = htDomGroups.get(htDomKey);
-
+				log.info("處理 HT-DOM 組: " + htDomKey + ", 包含 MeasureIDs: " + String.join(", ", groupMeasureIds));
 				int xCol = i * 2 + 1;
 				int yCol = i * 2 + 2;
 
@@ -734,5 +1098,18 @@ public class PSZYGOReportProcess extends SvrProcess {
 		style.setFont(font);
 
 		return style;
+	}
+
+	// 用于排序measureId的辅助类
+	private class MeasureInfo {
+		String measureId;
+		double htValue;
+		String dom;
+
+		MeasureInfo(String measureId, double htValue, String dom) {
+			this.measureId = measureId;
+			this.htValue = htValue;
+			this.dom = dom;
+		}
 	}
 }
