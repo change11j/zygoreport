@@ -4,6 +4,7 @@ import org.adempiere.base.IProcessFactory;
 import org.compiere.process.ProcessCall;
 import org.osgi.service.component.annotations.Component;
 
+import tw.topgiga.zygoreport.report.PSZYGOReportProcess;
 import tw.topgiga.zygoreport.report.ZYGOReportProcess;
 
 @Component(
@@ -13,9 +14,11 @@ public class ZYGOReportProcessFactory implements IProcessFactory {
 
 	@Override
 	public ProcessCall newProcessInstance(String className) {
-		// TODO Auto-generated method stub
 		if (className.equals(ZYGOReportProcess.class.getName())) {
 			return new ZYGOReportProcess();
+		}
+		if (className.equals(PSZYGOReportProcess.class.getName())) {
+			return new PSZYGOReportProcess();
 		}
 		return null;
 	}
