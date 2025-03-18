@@ -581,6 +581,7 @@ public class PSZYGOReportProcess extends SvrProcess {
 		}
 
 		List<String> positions = new ArrayList<>(allPositions);
+		// 數字排序
 		Collections.sort(positions, (a, b) -> {
 			try {
 				return Integer.compare(Integer.parseInt(a), Integer.parseInt(b));
@@ -588,85 +589,368 @@ public class PSZYGOReportProcess extends SvrProcess {
 				return a.compareTo(b);
 			}
 		});
+
 		log.info("Position排序結果: " + String.join(", ", positions));
 
-		// 7. 創建Position數據部分
-		for (String position : positions) {
-			log.info("處理Position: " + position);
-			// 創建Position標題行
-			Row positionRow = sheet.createRow(rowNum++);
-			Cell positionCell = positionRow.createCell(0);
-			positionCell.setCellValue("Position " + position);
-			positionCell.setCellStyle(headerStyle);
+		// 2. 創建平均值行
+		// TCD平均值行
+		Row tcdAvgRow = sheet.createRow(rowNum++);
+		Cell tcdAvgLabelCell = tcdAvgRow.createCell(0);
+		tcdAvgLabelCell.setCellValue("TCD");
+		tcdAvgLabelCell.setCellStyle(headerStyle);
 
-			// 合併標題單元格
-			for (int i = 1; i < columnCount; i++) {
-				Cell cell = positionRow.createCell(i);
-				cell.setCellStyle(headerStyle);
+		// BCD平均值行
+		Row bcdAvgRow = sheet.createRow(rowNum++);
+		Cell bcdAvgLabelCell = bcdAvgRow.createCell(0);
+		bcdAvgLabelCell.setCellValue("BCD");
+		bcdAvgLabelCell.setCellStyle(headerStyle);
+
+		// PSH平均值行
+		Row pshAvgRow = sheet.createRow(rowNum++);
+		Cell pshAvgLabelCell = pshAvgRow.createCell(0);
+		pshAvgLabelCell.setCellValue("PSH");
+		pshAvgLabelCell.setCellStyle(headerStyle);
+
+		// B-T行
+		Row btRow = sheet.createRow(rowNum++);
+		Cell btLabelCell = btRow.createCell(0);
+		btLabelCell.setCellValue("B-T (Bot-Top)");
+		btLabelCell.setCellStyle(blueStyle);
+
+		// 識別具有HT=100的DOM值，用於創建M-S行
+		List<String> mainDomValues = new ArrayList<>();
+		for (String htDomKey : htDomKeys) {
+			String[] parts = htDomKey.split("-");
+			String ht = parts[0];
+			String dom = parts.length > 1 ? parts[1] : "";
+
+			if (ht.equals("100.0")) {
+				mainDomValues.add(dom);
 			}
-			sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 0, columnCount - 1));
+		}
 
-			// 創建數據行
-			Row tcdRow = sheet.createRow(rowNum++);
-			Cell tcdLabelCell = tcdRow.createCell(0);
-			tcdLabelCell.setCellValue("TCD");
-			tcdLabelCell.setCellStyle(headerStyle);
-
-			Row bcdRow = sheet.createRow(rowNum++);
-			Cell bcdLabelCell = bcdRow.createCell(0);
-			bcdLabelCell.setCellValue("BCD");
-			bcdLabelCell.setCellStyle(headerStyle);
-
-			Row pshRow = sheet.createRow(rowNum++);
-			Cell pshLabelCell = pshRow.createCell(0);
-			pshLabelCell.setCellValue("PSH");
-			pshLabelCell.setCellStyle(headerStyle);
-
+		// 創建M-S行
+		Map<String, Integer> mainDomRowMap = new HashMap<>(); // 存儲每個main dom對應的行號
+		for (String mainDom : mainDomValues) {
 			Row msRow = sheet.createRow(rowNum++);
 			Cell msLabelCell = msRow.createCell(0);
-			msLabelCell.setCellValue("M-S");
+			msLabelCell.setCellValue("M(" + mainDom + ")-S");
 			msLabelCell.setCellStyle(blueStyle);
+			mainDomRowMap.put(mainDom, rowNum - 1);
+		}
 
-			// 為每個HT-DOM組填充數據
-			for (int i = 0; i < htDomKeys.size(); i++) {
-				String htDomKey = htDomKeys.get(i);
-				Map<String, Map<String, String>> positionDataMap = htDomData.getOrDefault(htDomKey, new HashMap<>());
+		// 為所有HT-DOM組計算平均值並填充到相應單元格
+		Map<String, Double[]> htDomAverages = new HashMap<>(); // 存儲每個HT-DOM組的平均值 [tcdX, tcdY, bcdX, bcdY, psh]
+
+		for (int i = 0; i < htDomKeys.size(); i++) {
+			String htDomKey = htDomKeys.get(i);
+			Map<String, Map<String, String>> positionDataMap = htDomData.getOrDefault(htDomKey, new HashMap<>());
+
+			int xCol = i * 2 + 1;
+			int yCol = i * 2 + 2;
+
+			// 計算該HT-DOM組下所有position的平均值
+			double tcdXSum = 0, tcdYSum = 0, bcdXSum = 0, bcdYSum = 0, pshSum = 0;
+			int tcdXCount = 0, tcdYCount = 0, bcdXCount = 0, bcdYCount = 0, pshCount = 0;
+
+			for (String position : positions) {
 				Map<String, String> dataMap = positionDataMap.getOrDefault(position, new HashMap<>());
-				log.info("  HT-DOM鍵: " + htDomKey + ", Position: " + position + ", 找到數據: " + !dataMap.isEmpty());
 
 				if (!dataMap.isEmpty()) {
-					log.info("    數據內容: measureId=" + dataMap.getOrDefault("measure_id", "未知") + ", TCD DX="
-							+ dataMap.getOrDefault("TCD DX-95%", "無") + ", TCD DY="
-							+ dataMap.getOrDefault("TCD DY", "無") + ", PS-BOT-DX="
-							+ dataMap.getOrDefault("PS-BOT-DX", "無") + ", PS-BOT-DY="
-							+ dataMap.getOrDefault("PS-BOT-DY", "無") + ", PS-Hp=" + dataMap.getOrDefault("PS-Hp", "無"));
-				}
-				int xCol = i * 2 + 1;
-				int yCol = i * 2 + 2;
-
-				if (!dataMap.isEmpty()) {
-					// 獲取所有需要的數據
+					// 獲取數據
 					String tcdX = dataMap.getOrDefault("TCD DX-95%", "");
 					String tcdY = dataMap.getOrDefault("TCD DY", "");
 					String bcdX = dataMap.getOrDefault("PS-BOT-DX", "");
 					String bcdY = dataMap.getOrDefault("PS-BOT-DY", "");
 					String psh = dataMap.getOrDefault("PS-Hp", "");
 
-					log.info("    數據值: TCD DX=" + tcdX + ", TCD DY=" + tcdY + ", PS-BOT-DX=" + bcdX + ", PS-BOT-DY="
-							+ bcdY + ", PS-Hp=" + psh);
-					// 填充TCD數據
-					setNumericCellValue(tcdRow.createCell(xCol), dataMap.getOrDefault("TCD DX-95%", ""), numberStyle);
-					setNumericCellValue(tcdRow.createCell(yCol), dataMap.getOrDefault("TCD DY", ""), numberStyle);
+					// 累加有效數據
+					if (!tcdX.isEmpty()) {
+						try {
+							tcdXSum += Double.parseDouble(tcdX);
+							tcdXCount++;
+						} catch (NumberFormatException e) {
+							log.warning("無法解析TCD DX值: " + tcdX);
+						}
+					}
 
-					// 填充BCD數據
-					setNumericCellValue(bcdRow.createCell(xCol), dataMap.getOrDefault("PS-BOT-DX", ""), numberStyle);
-					setNumericCellValue(bcdRow.createCell(yCol), dataMap.getOrDefault("PS-BOT-DY", ""), numberStyle);
+					if (!tcdY.isEmpty()) {
+						try {
+							tcdYSum += Double.parseDouble(tcdY);
+							tcdYCount++;
+						} catch (NumberFormatException e) {
+							log.warning("無法解析TCD DY值: " + tcdY);
+						}
+					}
 
-					// 填充PSH數據
-					setNumericCellValue(pshRow.createCell(xCol), dataMap.getOrDefault("PS-Hp", ""), numberStyle);
-					pshRow.createCell(yCol).setCellStyle(numberStyle); // Y列保持空白
+					if (!bcdX.isEmpty()) {
+						try {
+							bcdXSum += Double.parseDouble(bcdX);
+							bcdXCount++;
+						} catch (NumberFormatException e) {
+							log.warning("無法解析PS-BOT-DX值: " + bcdX);
+						}
+					}
+
+					if (!bcdY.isEmpty()) {
+						try {
+							bcdYSum += Double.parseDouble(bcdY);
+							bcdYCount++;
+						} catch (NumberFormatException e) {
+							log.warning("無法解析PS-BOT-DY值: " + bcdY);
+						}
+					}
+
+					if (!psh.isEmpty()) {
+						try {
+							pshSum += Double.parseDouble(psh);
+							pshCount++;
+						} catch (NumberFormatException e) {
+							log.warning("無法解析PS-Hp值: " + psh);
+						}
+					}
+				}
+			}
+
+			// 計算平均值
+			double tcdXAvg = tcdXCount > 0 ? tcdXSum / tcdXCount : 0;
+			double tcdYAvg = tcdYCount > 0 ? tcdYSum / tcdYCount : 0;
+			double bcdXAvg = bcdXCount > 0 ? bcdXSum / bcdXCount : 0;
+			double bcdYAvg = bcdYCount > 0 ? bcdYSum / bcdYCount : 0;
+			double pshAvg = pshCount > 0 ? pshSum / pshCount : 0;
+
+			// 存儲平均值以供後續計算
+			htDomAverages.put(htDomKey, new Double[] { tcdXAvg, tcdYAvg, bcdXAvg, bcdYAvg, pshAvg });
+
+			// 填充平均值到表格
+			// TCD平均值
+			Cell tcdXAvgCell = tcdAvgRow.createCell(xCol);
+			tcdXAvgCell.setCellValue(tcdXAvg);
+			tcdXAvgCell.setCellStyle(numberStyle);
+
+			Cell tcdYAvgCell = tcdAvgRow.createCell(yCol);
+			tcdYAvgCell.setCellValue(tcdYAvg);
+			tcdYAvgCell.setCellStyle(numberStyle);
+
+			// BCD平均值
+			Cell bcdXAvgCell = bcdAvgRow.createCell(xCol);
+			bcdXAvgCell.setCellValue(bcdXAvg);
+			bcdXAvgCell.setCellStyle(numberStyle);
+
+			Cell bcdYAvgCell = bcdAvgRow.createCell(yCol);
+			bcdYAvgCell.setCellValue(bcdYAvg);
+			bcdYAvgCell.setCellStyle(numberStyle);
+
+			// PSH平均值
+			Cell pshAvgCell = pshAvgRow.createCell(xCol);
+			pshAvgCell.setCellValue(pshAvg);
+			pshAvgCell.setCellStyle(numberStyle);
+
+			// Y列留空，但設置樣式
+			pshAvgRow.createCell(yCol).setCellStyle(numberStyle);
+
+			// 計算B-T (BCD-TCD)的差值
+			double btXDiff = bcdXAvg - tcdXAvg;
+			double btYDiff = bcdYAvg - tcdYAvg;
+
+			// 填充B-T差值
+			Cell btXCell = btRow.createCell(xCol);
+			btXCell.setCellValue(btXDiff);
+			btXCell.setCellStyle(numberStyle);
+
+			Cell btYCell = btRow.createCell(yCol);
+			btYCell.setCellValue(btYDiff);
+			btYCell.setCellStyle(numberStyle);
+		}
+
+		// 填充M-S行
+		for (int i = 0; i < htDomKeys.size(); i++) {
+			String htDomKey = htDomKeys.get(i);
+			String[] parts = htDomKey.split("-");
+			String ht = parts[0];
+			String dom = parts.length > 1 ? parts[1] : "";
+
+			int xCol = i * 2 + 1;
+			int yCol = i * 2 + 2;
+
+			// 獲取當前HT-DOM組的PSH平均值
+			Double[] currentAvgs = htDomAverages.get(htDomKey);
+			double currentPsh = currentAvgs != null ? currentAvgs[4] : 0;
+
+			// 對於每個main dom (HT=100的DOM值)，計算M-S差值
+			for (String mainDom : mainDomValues) {
+				int msRowIndex = mainDomRowMap.get(mainDom);
+				Row msRow = sheet.getRow(msRowIndex);
+
+				// 找到對應的main HT-DOM組
+				String mainHtDomKey = "100.0-" + mainDom;
+				Double[] mainAvgs = htDomAverages.get(mainHtDomKey);
+
+				if (ht.equals("100.0") && dom.equals(mainDom)) {
+					// 如果當前就是main dom，則顯示"-"
+					Cell msXCell = msRow.createCell(xCol);
+					msXCell.setCellValue("-");
+					msXCell.setCellStyle(basicStyle);
+
+					Cell msYCell = msRow.createCell(yCol);
+					msYCell.setCellStyle(basicStyle);
 				} else {
-					log.info("    沒有找到數據");
+					// 否則計算PSH差值 (main PSH - current PSH)
+					double mainPsh = mainAvgs != null ? mainAvgs[4] : 0;
+					double pshDiff = mainPsh - currentPsh;
+
+					Cell msXCell = msRow.createCell(xCol);
+					msXCell.setCellValue(pshDiff);
+					msXCell.setCellStyle(numberStyle);
+
+					Cell msYCell = msRow.createCell(yCol);
+					msYCell.setCellStyle(numberStyle);
+				}
+			}
+		}
+
+		// 3. 處理每個 Position 的數據行
+		rowNum = createPositionRows(sheet, rowNum, slideId, htDomKeys, htDomData, positions, mainDomValues,
+				htDomAverages, headerStyle, basicStyle, numberStyle, orangeStyle, blueStyle);
+
+		return rowNum;
+	}
+
+	// 新增方法：處理每個Position的資料行
+	private int createPositionRows(XSSFSheet sheet, int rowNum, String slideId, List<String> htDomKeys,
+			Map<String, Map<String, Map<String, String>>> htDomData, List<String> positions, List<String> mainDomValues,
+			Map<String, Double[]> htDomAverages, CellStyle headerStyle, CellStyle basicStyle, CellStyle numberStyle,
+			CellStyle orangeStyle, CellStyle blueStyle) {
+
+		// 為每個 Position 創建數據行
+		for (String position : positions) {
+			// 創建 Position 標題行
+			Row positionRow = sheet.createRow(rowNum++);
+			Cell positionCell = positionRow.createCell(0);
+			positionCell.setCellValue("Position " + position);
+			positionCell.setCellStyle(headerStyle);
+
+			// 合併標題單元格
+			for (int i = 1; i < htDomKeys.size() * 2 + 1; i++) {
+				Cell cell = positionRow.createCell(i);
+				cell.setCellStyle(headerStyle);
+			}
+			sheet.addMergedRegion(new CellRangeAddress(rowNum - 1, rowNum - 1, 0, htDomKeys.size() * 2));
+
+			// 創建 TCD 行
+			Row tcdRow = sheet.createRow(rowNum++);
+			Cell tcdLabelCell = tcdRow.createCell(0);
+			tcdLabelCell.setCellValue("TCD");
+			tcdLabelCell.setCellStyle(headerStyle);
+
+			// 創建 BCD 行
+			Row bcdRow = sheet.createRow(rowNum++);
+			Cell bcdLabelCell = bcdRow.createCell(0);
+			bcdLabelCell.setCellValue("BCD");
+			bcdLabelCell.setCellStyle(headerStyle);
+
+			// 創建 PSH 行
+			Row pshRow = sheet.createRow(rowNum++);
+			Cell pshLabelCell = pshRow.createCell(0);
+			pshLabelCell.setCellValue("PSH");
+			pshLabelCell.setCellStyle(headerStyle);
+
+			// 為每個 main dom 創建 M-S 行
+			Map<String, Integer> mainDomRowMap = new HashMap<>(); // 存儲每個 main dom 對應的行號
+			for (String mainDom : mainDomValues) {
+				Row msRow = sheet.createRow(rowNum++);
+				Cell msLabelCell = msRow.createCell(0);
+				msLabelCell.setCellValue("M(" + mainDom + ")-S");
+				msLabelCell.setCellStyle(blueStyle);
+				mainDomRowMap.put(mainDom, rowNum - 1);
+			}
+
+			// 填充每個 HT-DOM 組的數據
+			for (int i = 0; i < htDomKeys.size(); i++) {
+				String htDomKey = htDomKeys.get(i);
+				String[] parts = htDomKey.split("-");
+				String ht = parts[0];
+				String dom = parts.length > 1 ? parts[1] : "";
+
+				Map<String, Map<String, String>> positionDataMap = htDomData.getOrDefault(htDomKey, new HashMap<>());
+				Map<String, String> dataMap = positionDataMap.getOrDefault(position, new HashMap<>());
+
+				int xCol = i * 2 + 1;
+				int yCol = i * 2 + 2;
+
+				// 填充 TCD, BCD, PSH 數據
+				if (!dataMap.isEmpty()) {
+					String tcdX = dataMap.getOrDefault("TCD DX-95%", "");
+					String tcdY = dataMap.getOrDefault("TCD DY", "");
+					String bcdX = dataMap.getOrDefault("PS-BOT-DX", "");
+					String bcdY = dataMap.getOrDefault("PS-BOT-DY", "");
+					String psh = dataMap.getOrDefault("PS-Hp", "");
+
+					// TCD 數據
+					setNumericCellValue(tcdRow.createCell(xCol), tcdX, numberStyle);
+					setNumericCellValue(tcdRow.createCell(yCol), tcdY, numberStyle);
+
+					// BCD 數據
+					setNumericCellValue(bcdRow.createCell(xCol), bcdX, numberStyle);
+					setNumericCellValue(bcdRow.createCell(yCol), bcdY, numberStyle);
+
+					// PSH 數據
+					setNumericCellValue(pshRow.createCell(xCol), psh, numberStyle);
+					pshRow.createCell(yCol).setCellStyle(numberStyle); // Y 列保持空白
+
+					// 獲取當前 position 的 PSH 值
+					double currentPsh = 0;
+					try {
+						if (!psh.isEmpty()) {
+							currentPsh = Double.parseDouble(psh);
+						}
+					} catch (NumberFormatException e) {
+						log.warning("無法解析 PSH 值: " + psh);
+					}
+
+					// 填充 M-S 行
+					for (String mainDom : mainDomValues) {
+						int msRowIndex = mainDomRowMap.get(mainDom);
+						Row msRow = sheet.getRow(msRowIndex);
+
+						// 找到對應的 main HT-DOM 組的 position 數據
+						String mainHtDomKey = "100.0-" + mainDom;
+						Map<String, Map<String, String>> mainPositionDataMap = htDomData.getOrDefault(mainHtDomKey,
+								new HashMap<>());
+						Map<String, String> mainDataMap = mainPositionDataMap.getOrDefault(position, new HashMap<>());
+
+						if (ht.equals("100.0") && dom.equals(mainDom)) {
+							// 如果當前就是 main dom，則顯示"-"
+							Cell msXCell = msRow.createCell(xCol);
+							msXCell.setCellValue("-");
+							msXCell.setCellStyle(basicStyle);
+
+							Cell msYCell = msRow.createCell(yCol);
+							msYCell.setCellStyle(basicStyle);
+						} else {
+							// 獲取 main position 的 PSH 值
+							double mainPsh = 0;
+							String mainPshStr = mainDataMap.getOrDefault("PS-Hp", "");
+							try {
+								if (!mainPshStr.isEmpty()) {
+									mainPsh = Double.parseDouble(mainPshStr);
+								}
+							} catch (NumberFormatException e) {
+								log.warning("無法解析 main PSH 值: " + mainPshStr);
+							}
+
+							// 計算 PSH 差值 (main PSH - current PSH)
+							double pshDiff = mainPsh - currentPsh;
+
+							Cell msXCell = msRow.createCell(xCol);
+							msXCell.setCellValue(pshDiff);
+							msXCell.setCellStyle(numberStyle);
+
+							Cell msYCell = msRow.createCell(yCol);
+							msYCell.setCellStyle(numberStyle);
+						}
+					}
+				} else {
 					// 如果沒有數據，填充空單元格
 					tcdRow.createCell(xCol).setCellStyle(numberStyle);
 					tcdRow.createCell(yCol).setCellStyle(numberStyle);
@@ -674,20 +958,21 @@ public class PSZYGOReportProcess extends SvrProcess {
 					bcdRow.createCell(yCol).setCellStyle(numberStyle);
 					pshRow.createCell(xCol).setCellStyle(numberStyle);
 					pshRow.createCell(yCol).setCellStyle(numberStyle);
-				}
 
-				// M-S行數據處理保持不變
-				if (i == 0) {
-					Cell dashCell = msRow.createCell(xCol);
-					dashCell.setCellValue("-");
-					dashCell.setCellStyle(basicStyle);
+					// 填充 M-S 行
+					for (String mainDom : mainDomValues) {
+						int msRowIndex = mainDomRowMap.get(mainDom);
+						Row msRow = sheet.getRow(msRowIndex);
 
-					Cell zeroCell = msRow.createCell(yCol);
-					zeroCell.setCellValue(0.000);
-					zeroCell.setCellStyle(numberStyle);
-				} else {
-					msRow.createCell(xCol).setCellStyle(basicStyle);
-					msRow.createCell(yCol).setCellStyle(basicStyle);
+						if (ht.equals("100.0") && dom.equals(mainDom)) {
+							Cell msXCell = msRow.createCell(xCol);
+							msXCell.setCellValue("-");
+							msXCell.setCellStyle(basicStyle);
+						} else {
+							msRow.createCell(xCol).setCellStyle(numberStyle);
+						}
+						msRow.createCell(yCol).setCellStyle(numberStyle);
+					}
 				}
 			}
 		}
